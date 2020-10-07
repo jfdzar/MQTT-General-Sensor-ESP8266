@@ -17,7 +17,7 @@
 #include "WiFiCredentials.h"
 
 /************************* Adafruit.io Setup *********************************/
-#define MQTT_FEED "test"
+#define MQTT_FEED "living"
 
 #define LEAK_SENSOR_PIN 5
 #define LED_STATUS_PIN LED_BUILTIN
@@ -34,12 +34,22 @@
 
 #define BUZZER_PIN 13
 
+#define READ_SENSORS_PERIOD 3 * 60 * 1000
+
+#define ALARM_MQTT_TIMEOUT 10000
+
+#define ALARM_REPETITIONS 3
+#define ALARM_DUTY_CYCLE 100
+#define ALARM_WAITING 200
+
 /************ Global Variables ******************/
 boolean debug = true;
 
 int i = 0;
 bool status_leak = false;
 bool previous_status_leak = false;
+
+bool alarm = false;
 
 DHT dht;
 double T = 0;
@@ -50,8 +60,6 @@ double earth_T = 0;
 
 OneWire oneWire(ONE_WIRE_BUS);
 DallasTemperature ds(&oneWire);
-
-const int sleepTimeS = DEEP_SLEEP_TIME;
 
 /************ Global State (you don't need to change this!) ******************/
 
@@ -66,10 +74,16 @@ Adafruit_MQTT_Client mqtt(&client, AIO_SERVER, AIO_SERVERPORT, AIO_USERNAME, AIO
 
 // Notice MQTT paths for AIO follow the form: <username>/feeds/<feedname>
 Adafruit_MQTT_Publish leak_status = Adafruit_MQTT_Publish(&mqtt, AIO_USERNAME "/feeds/" MQTT_FEED "/leak");
-Adafruit_MQTT_Publish kitchen_earth_T = Adafruit_MQTT_Publish(&mqtt, AIO_USERNAME "/feeds/" MQTT_FEED "/earth_temperature");
-Adafruit_MQTT_Publish kitchen_t = Adafruit_MQTT_Publish(&mqtt, AIO_USERNAME "/feeds/" MQTT_FEED "/temperature");
-Adafruit_MQTT_Publish kitchen_h = Adafruit_MQTT_Publish(&mqtt, AIO_USERNAME "/feeds/" MQTT_FEED "/humidity");
-Adafruit_MQTT_Publish kitchen_v = Adafruit_MQTT_Publish(&mqtt, AIO_USERNAME "/feeds/" MQTT_FEED "/voltage");
+Adafruit_MQTT_Publish dallas_T = Adafruit_MQTT_Publish(&mqtt, AIO_USERNAME "/feeds/" MQTT_FEED "/earth_temperature");
+Adafruit_MQTT_Publish dh_t = Adafruit_MQTT_Publish(&mqtt, AIO_USERNAME "/feeds/" MQTT_FEED "/temperature");
+Adafruit_MQTT_Publish dh_h = Adafruit_MQTT_Publish(&mqtt, AIO_USERNAME "/feeds/" MQTT_FEED "/humidity");
+
+// Notice MQTT paths for AIO follow the form: <username>/feeds/<feedname>
+// Setup a feed called 'onoff' for subscribing to changes.
+Adafruit_MQTT_Subscribe alarmsignal = Adafruit_MQTT_Subscribe(&mqtt, AIO_USERNAME "/feeds/" MQTT_FEED "/alarm");
+Adafruit_MQTT_Subscribe alarmpwm = Adafruit_MQTT_Subscribe(&mqtt, AIO_USERNAME "/feeds/" MQTT_FEED "/alarmpwm");
+Adafruit_MQTT_Subscribe alarmtimeout = Adafruit_MQTT_Subscribe(&mqtt, AIO_USERNAME "/feeds/" MQTT_FEED "/alarmtimeout");
+Adafruit_MQTT_Subscribe alarmwait = Adafruit_MQTT_Subscribe(&mqtt, AIO_USERNAME "/feeds/" MQTT_FEED "/alarmwait");
 
 /*************************** Sketch Code ************************************/
 
@@ -106,6 +120,8 @@ void check_status_leak()
 
 void readSensors()
 {
+  //bool local_debug = debug;
+  bool local_debug = false;
 
   int h_count = 0;
   int T_count = 0;
@@ -132,7 +148,7 @@ void readSensors()
       h = h + value_read;
       h_count = h_count + 1;
     }
-    if (debug)
+    if (local_debug)
     {
       Serial.println(h);
     }
@@ -143,7 +159,7 @@ void readSensors()
       T = T + value_read;
       T_count = T_count + 1;
     }
-    if (debug)
+    if (local_debug)
     {
       Serial.println(T);
     }
@@ -154,7 +170,7 @@ void readSensors()
       earth_T = earth_T + value_read;
       earth_T_count = earth_T_count + 1;
     }
-    if (debug)
+    if (local_debug)
     {
       Serial.println(earth_T);
     }
@@ -165,7 +181,7 @@ void readSensors()
       v = v + value_read;
       v_count = v_count + 1;
     }
-    if (debug)
+    if (local_debug)
     {
       Serial.println(v);
     }
@@ -179,19 +195,19 @@ void readSensors()
   earth_T = earth_T / earth_T_count;
   v = v / v_count;
 
-  if (debug)
+  if (local_debug)
   {
     Serial.println(h);
   }
-  if (debug)
+  if (local_debug)
   {
     Serial.println(T);
   }
-  if (debug)
+  if (local_debug)
   {
     Serial.println(earth_T_count);
   }
-  if (debug)
+  if (local_debug)
   {
     Serial.println(v_count);
   }
@@ -245,13 +261,9 @@ void MQTT_connect()
 void setup()
 {
 
-  if (debug)
-  {
-    Serial.begin(9600);
-    delay(100);
-    Serial.println("Waking Up");
-  }
+  Serial.begin(9600);
 
+  //Set Pin Modes
   pinMode(LEAK_SENSOR_PIN, INPUT);
   pinMode(LED_STATUS_PIN, OUTPUT);
   pinMode(VOLTAGE_PIN, INPUT);
@@ -259,11 +271,16 @@ void setup()
   digitalWrite(LED_STATUS_PIN, HIGH);
   digitalWrite(LEAK_SENSOR_PIN, HIGH);
 
+  //Short Buzzer Test on Reset
+  /*
   digitalWrite(BUZZER_PIN, LOW);
-  delay(500);
+  delay(100);
   digitalWrite(BUZZER_PIN, HIGH);
-  delay(500);
+  delay(100);
   digitalWrite(BUZZER_PIN, LOW);
+  */
+
+  delay(1000);
 
   if (debug)
   {
@@ -285,102 +302,137 @@ void setup()
       {
         Serial.println("Error Connecting - Restarting...");
       }
-      //ESP.restart();
-      ESP.deepSleep(sleepTimeS * 1000000);
+      ESP.restart();
     }
   }
 
-  MQTT_connect();
+  // Setup MQTT subscription for onoff & slider feed.
+  mqtt.subscribe(&alarmsignal);
+  mqtt.subscribe(&alarmpwm);
+  mqtt.subscribe(&alarmtimeout);
+  mqtt.subscribe(&alarmwait);
+
   digitalWrite(LED_STATUS_PIN, LOW);
 
-  if (debug)
-  {
-    Serial.println("Checking Leak");
-  }
-  digitalWrite(LEAK_SENSOR_PIN, HIGH);
-  check_status_leak();
-  if (status_leak)
-  {
-    publishMsg(leak_status, "No Leak");
-  }
-  else
-  {
-    publishMsg(leak_status, "Leak");
-  }
-
-  if (debug)
-  {
-    Serial.println("Checking Sensors");
-  }
-  readSensors();
-
-  char data[100];
-
-  sprintf(data, "%f", T);
-  if (debug)
-  {
-    Serial.print("Temperature: ");
-  }
-  if (debug)
-  {
-    Serial.println(T);
-  }
-  publishMsg(kitchen_t, data);
-
-  sprintf(data, "%f", h);
-  if (debug)
-  {
-    Serial.print("Humidity: ");
-  }
-  if (debug)
-  {
-    Serial.println(h);
-  }
-  publishMsg(kitchen_h, data);
-
-  sprintf(data, "%f", v);
-  if (debug)
-  {
-    Serial.print("Voltage: ");
-  }
-  if (debug)
-  {
-    Serial.println(v);
-  }
-  publishMsg(kitchen_v, data);
-
-  sprintf(data, "%f", earth_T);
-  if (debug)
-  {
-    Serial.print("Earth Temperature: ");
-  }
-  if (debug)
-  {
-    Serial.println(earth_T);
-  }
-  publishMsg(kitchen_earth_T, data);
-
-  //Going in sleep Mode
-  if (debug)
-  {
-    Serial.println("Going in Deep Sleep Mode");
-  }
   delay(1000);
-  ESP.deepSleep(sleepTimeS * 1000000);
-
-  //if(debug){Serial.println("Sleep Mode Working?");}
 }
 
 void loop()
 {
-  //In Deep-Sleep only the setup function works
-  /*
-  delay(5000);
 
-  char data[100];
-  sprintf(data,"%f",T);
-  publishMsg(kitchen_t,data);
-  sprintf(data,"%f",h);
-  publishMsg(kitchen_h,data);
-  */
+  unsigned long currentMillis = 0;
+  unsigned long previousMillis = 0;
+
+  unsigned long ReadSensors = READ_SENSORS_PERIOD;
+
+  uint16_t AlarmDutyCycle = ALARM_DUTY_CYCLE;
+  unsigned long AlarmTimeout = ALARM_MQTT_TIMEOUT;
+  unsigned long AlarmWaiting = ALARM_WAITING;
+
+  while (1)
+  {
+
+    currentMillis = millis();
+
+    MQTT_connect();
+
+    Serial.println(F("Reading Subscription.."));
+    Adafruit_MQTT_Subscribe *subscription;
+    while ((subscription = mqtt.readSubscription(AlarmTimeout)))
+    {
+      // Check if its the onoff button feed
+      if (subscription == &alarmsignal)
+      {
+        Serial.print(F("Alarm State: "));
+        Serial.println((char *)alarmsignal.lastread);
+
+        if (strcmp((char *)alarmsignal.lastread, "ON") == 0)
+        {
+          digitalWrite(LED_STATUS_PIN, LOW);
+          alarm = true;
+        }
+        if (strcmp((char *)alarmsignal.lastread, "OFF") == 0)
+        {
+          digitalWrite(LED_STATUS_PIN, HIGH);
+          alarm = false;
+        }
+      }
+      if (subscription == &alarmpwm)
+      {
+        Serial.print(F("PWM Duty Cycle: "));
+        Serial.println((char *)alarmpwm.lastread);
+        uint16_t alarmpwmval = atoi((char *)alarmpwm.lastread); // convert to a number
+        AlarmDutyCycle = alarmpwmval;
+      }
+      if (subscription == &alarmwait)
+      {
+        Serial.print(F("Wait: "));
+        Serial.println((char *)alarmwait.lastread);
+        unsigned long alarmwaitval = atoi((char *)alarmwait.lastread); // convert to a number
+        AlarmWaiting = alarmwaitval;
+      }
+
+      if (subscription == &alarmtimeout)
+      {
+        Serial.print(F("Timeout: "));
+        Serial.println((char *)alarmtimeout.lastread);
+        unsigned long alarmtimeoutval = atoi((char *)alarmtimeout.lastread); // convert to a number
+        AlarmTimeout = alarmtimeoutval;
+      }
+    }
+
+    if (alarm)
+    {
+      for (int i = 1; i <= ALARM_REPETITIONS; i++)
+      {
+        //digitalWrite(BUZZER_PIN, HIGH);
+        analogWrite(BUZZER_PIN, AlarmDutyCycle);
+        delay(AlarmWaiting);
+        digitalWrite(BUZZER_PIN, LOW);
+        delay(AlarmWaiting);
+      }
+    }
+
+    if ((currentMillis - previousMillis >= ReadSensors))
+    {
+      previousMillis = currentMillis;
+      if (debug)
+      {
+        Serial.println("Checking Sensors");
+      }
+      readSensors();
+      char data[100];
+      sprintf(data, "%f", T);
+      if (debug)
+      {
+        Serial.print("Temperature: ");
+      }
+      if (debug)
+      {
+        Serial.println(T);
+      }
+      publishMsg(dh_t, data);
+
+      sprintf(data, "%f", h);
+      if (debug)
+      {
+        Serial.print("Humidity: ");
+      }
+      if (debug)
+      {
+        Serial.println(h);
+      }
+      publishMsg(dh_h, data);
+      sprintf(data, "%f", earth_T);
+      if (debug)
+      {
+        Serial.print("Earth Temperature: ");
+      }
+      if (debug)
+      {
+        Serial.println(earth_T);
+      }
+      publishMsg(dallas_T, data);
+    }
+  }
 }
