@@ -1,0 +1,4 @@
+.vscode/
+include/WiFiCredentials.h
+.pio/build
+*.github
